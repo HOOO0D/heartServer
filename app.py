@@ -20,7 +20,9 @@ MODEL_PATH      = r'E:\ECG_NEW\rfModel.mat'
 
 eng.addpath(MATLAB_CODE_DIR, nargout=0)
 
-FS = 360.0   # 采样率
+# 硬件真实采样率：单片机以 360 Hz 采样，只是每 4 个点打包发一次
+# 我们在 Flask 里把这 4 个点“摊开”为 4 个时间点，所以这里仍然用 360
+FS = 360
 
 app = Flask(__name__)
 
@@ -29,7 +31,9 @@ app = Flask(__name__)
 capture_state = {
     "active": False,       # 是否正在收集原始数据（true 表示正在收集 60s）
     "start_time": None,    # 开始采集的时间 time.time()
-    "buffer": [],          # 已收集的数据：[[v1, v2, v3, v4], ...]
+    # 注意：这里的 buffer 改成了一维列表，里面是展开后的 ECG 点列：
+    # [x0, x1, x2, x3, x4, ...]，长度 ≈ FS * 60
+    "buffer": [],
     "status": "idle",      # idle / collecting / processing / done / error
     "result": None,        # MATLAB 返回的结果（Python dict）
     "error": None          # 出错信息
@@ -37,16 +41,18 @@ capture_state = {
 
 capture_lock = threading.Lock()  # 并发访问保护
 
-# 实时缓存（可选）
-live_buffer = deque(maxlen=1000)  # 最近的数据
+# 实时缓存（可选）：仍然保存每个包的 [val1,val2,val3,val4]，方便调试
+live_buffer = deque(maxlen=1000)
 
 
 # ========== MATLAB 调用封装 ==========
 
-def run_matlab_analysis(samples_4ch):
+def run_matlab_analysis(samples_flat):
     """
     调用 MATLAB 对采集到的心电数据进行处理。
-    samples_4ch: List[List[float]]，形状约为 (N, 4)，每行 [val1, val2, val3, val4]
+
+    samples_flat: List[float]，一维 ECG 序列，已经是 360 Hz 的时间序列：
+        [x0, x1, x2, x3, x4, ...]
 
     返回 Python dict，里面包含：
       - labels: [str, ...]
@@ -55,14 +61,11 @@ def run_matlab_analysis(samples_4ch):
       - rpeaks_image_base64: "...."
       - 其他一些简单统计
     """
-    if not samples_4ch:
+    if not samples_flat:
         raise ValueError("no samples collected")
 
-    arr = np.array(samples_4ch, dtype=float)  # (N,4)
-
-    # 1. 选一个通道作为 ECG（例如 val1）
-    #    如果你想用 val2，就改成 arr[:, 1]
-    ecg_ch = arr[:, 0]
+    # 1. 转成 numpy 一维数组
+    ecg_ch = np.array(samples_flat, dtype=float).reshape(-1)
 
     # 2. 转成 matlab.double 列向量
     ecg_vec = matlab.double(ecg_ch.tolist())
@@ -74,8 +77,6 @@ def run_matlab_analysis(samples_4ch):
     res = eng.analyze_ecg_1min(ecg_vec, float(FS), MODEL_PATH, nargout=1)
 
     # 4. 从 MATLAB struct 解析字段
-    #    注意：MATLAB Engine 返回的 struct 在 Python 里类似 dict，可以用 res['字段名']
-    #    —— labels 是 cellstr（前面让你在 MATLAB 里 cellstr(labels)）
     labels_cell = res['labels']    # 这是 matlab 的 cell 数组
     labels_py = [str(s) for s in labels_cell]   # 转成 Python list[str]
 
@@ -111,7 +112,6 @@ def run_matlab_analysis(samples_4ch):
         print("[Flask] R-peak figure not found or empty:", fig_path)
 
     # 简单统计一下正常/异常比例（假设 Situation=0 正常，1 异常）
-    # 如果你 labels 里就是 "0"/"1"，可以用下面逻辑；否则根据你的实际标签名改
     total_beats = len(labels_py)
     abnormal_beats = 0
     for lab in labels_py:
@@ -135,11 +135,11 @@ def run_matlab_analysis(samples_4ch):
     }
 
 
-def _analysis_thread(samples_4ch):
+def _analysis_thread(samples_flat):
     """后台线程：调用 MATLAB 进行分析，并更新 capture_state。"""
     global capture_state
     try:
-        result = run_matlab_analysis(samples_4ch)
+        result = run_matlab_analysis(samples_flat)
         with capture_lock:
             capture_state["result"] = result
             capture_state["status"] = "done"
@@ -164,7 +164,7 @@ def index():
 def upload_data():
     """
     小程序持续 POST 数据的接口。
-    预期 JSON 格式：
+    预期 JSON 格式（一个包里有连续采集的 4 个点）：
     {
       "val1": 123,
       "val2": 456,
@@ -181,18 +181,22 @@ def upload_data():
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "invalid data"}), 400
 
-    sample = [val1, val2, val3, val4]
+    # 这一包里 4 个点按时间顺序采集，我们保留为列表方便调试
+    packet = [val1, val2, val3, val4]
 
     # 1. 实时缓存（可选）
-    live_buffer.append(sample)
+    live_buffer.append(packet)
 
-    # 2. 如果当前正在采集 60s，则把这条数据存进采集 buffer
+    # 2. 如果当前正在采集 60s，则把这 4 个点“展开”存进采集 buffer
     with capture_lock:
         if capture_state["active"] and capture_state["status"] == "collecting":
-            capture_state["buffer"].append(sample)
+            # 展开：buffer 变成一维 ECG 序列
+            capture_state["buffer"].extend(packet)
+
             elapsed = time.time() - capture_state["start_time"]
-            # 满足任一条件：时间 >= 60s 或 数据量 >= 21600
-            if elapsed >= 60 or len(capture_state["buffer"]) >= 21600:
+            # 满足任一条件：时间 >= 60s 或 样本点数 >= FS * 60
+            #    FS=360 → 需要约 21600 个点
+            if elapsed >= 60 or len(capture_state["buffer"]) >= FS * 60:
                 # 采集结束，启动后台线程调用 MATLAB
                 samples_copy = capture_state["buffer"][:]
                 capture_state["active"] = False
@@ -224,7 +228,7 @@ def start_capture():
         # 重置状态，开始新的采集
         capture_state["active"] = True
         capture_state["start_time"] = time.time()
-        capture_state["buffer"] = []
+        capture_state["buffer"] = []      # 一维 ECG 点
         capture_state["status"] = "collecting"
         capture_state["result"] = None
         capture_state["error"] = None
@@ -269,7 +273,6 @@ def capture_result():
 
 if __name__ == "__main__":
     # 用 python app.py 跑，不要再用 `flask run`，避免 debug 重启两次导致 MATLAB engine 启动两次
-    # debug 可以先关掉，或者用 use_reloader=False
     app.run(host="0.0.0.0", port=5000, debug=False)
     # 或者：
     # app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
