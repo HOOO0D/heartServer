@@ -5,122 +5,171 @@ import threading
 import time
 import os
 import base64
+import uuid
 
 import numpy as np
-
-# ==== MATLAB Engine ====
 import matlab.engine
 
 print("[Flask] Starting MATLAB engine...")
 eng = matlab.engine.start_matlab()
 
-# 把包含 analyze_ecg_1min.m 和模型的目录加到 MATLAB 路径里
-MATLAB_CODE_DIR = r'E:\ECG_NEW'      # 这里放 analyze_ecg_1min.m
+MATLAB_CODE_DIR = r'E:\ECG_NEW'
 MODEL_PATH      = r'E:\ECG_NEW\rfModel.mat'
 
 eng.addpath(MATLAB_CODE_DIR, nargout=0)
+eng.eval("rehash; clear functions; clear analyze_ecg_1min", nargout=0)
 
-# 硬件真实采样率：单片机以 360 Hz 采样，只是每 4 个点打包发一次
-# 我们在 Flask 里把这 4 个点“摊开”为 4 个时间点，所以这里仍然用 360
+# 硬件真实采样率：单片机 360Hz，每4点打包；后端展开后仍按360Hz
 FS = 360
+#FS=112
 
 app = Flask(__name__)
 
-# ========== 采集状态的全局变量 ==========
-
 capture_state = {
-    "active": False,       # 是否正在收集原始数据（true 表示正在收集 60s）
-    "start_time": None,    # 开始采集的时间 time.time()
-    # 注意：这里的 buffer 改成了一维列表，里面是展开后的 ECG 点列：
-    # [x0, x1, x2, x3, x4, ...]，长度 ≈ FS * 60
-    "buffer": [],
+    "active": False,
+    "start_time": None,
+    "buffer": [],          # 一维 ECG 点列 [x0,x1,...]
     "status": "idle",      # idle / collecting / processing / done / error
-    "result": None,        # MATLAB 返回的结果（Python dict）
-    "error": None          # 出错信息
+    "result": None,
+    "error": None,
+    "capture_id": None     #  本轮采集会话ID
 }
 
-capture_lock = threading.Lock()  # 并发访问保护
+capture_lock = threading.Lock()
 
-# 实时缓存（可选）：仍然保存每个包的 [val1,val2,val3,val4]，方便调试
+# 可选：调试缓存（只在 collecting 且 capture_id 匹配时写入）
 live_buffer = deque(maxlen=1000)
 
 
-# ========== MATLAB 调用封装 ==========
+def _matlab_to_str(x):
+    """把 MATLAB Engine 返回的字符串/char/list/tuple/ndarray 尽量稳地转成 Python str"""
+    if x is None:
+        return ""
+
+    # MATLAB 有时会返回 matlab.mlarray.char（看版本）
+    try:
+        import matlab  # matlab.engine 已经在用，一般也能 import matlab
+        if isinstance(x, matlab.mlarray.char):
+            # matlab char -> python str
+            return ''.join(x)
+    except Exception:
+        pass
+
+    # 兼容 list/tuple/ndarray：常见是 ['C:\\...png'] 或 array(['C:\\...'], dtype=object)
+    if isinstance(x, (list, tuple, np.ndarray)):
+        if len(x) == 0:
+            return ""
+        return _matlab_to_str(x[0])
+
+    # 兜底
+    return str(x)
+
+
+def _img_to_b64(path, cleanup_temp=True):
+    """读取 PNG 并转 base64；可选清理 tempdir 下的临时文件"""
+    if not path:
+        return None
+    if not os.path.exists(path):
+        return None
+
+    with open(path, "rb") as f:
+        b = f.read()
+    b64 = base64.b64encode(b).decode("ascii")
+
+    # 可选：清理临时目录下的文件，避免越跑越多
+    if cleanup_temp:
+        try:
+            tmp = os.path.abspath(tempfile.gettempdir())
+            pabs = os.path.abspath(path)
+            if pabs.startswith(tmp):
+                os.remove(pabs)
+        except Exception:
+            pass
+
+    return b64
+
 
 def run_matlab_analysis(samples_flat):
-    """
-    调用 MATLAB 对采集到的心电数据进行处理。
-
-    samples_flat: List[float]，一维 ECG 序列，已经是 360 Hz 的时间序列：
-        [x0, x1, x2, x3, x4, ...]
-
-    返回 Python dict，里面包含：
-      - labels: [str, ...]
-      - scores: [[p0, p1], ...]
-      - R_peaks: [int, ...]
-      - rpeaks_image_base64: "...."
-      - 其他一些简单统计
-    """
     if not samples_flat:
         raise ValueError("no samples collected")
 
-    # 1. 转成 numpy 一维数组
     ecg_ch = np.array(samples_flat, dtype=float).reshape(-1)
 
-    # 2. 转成 matlab.double 列向量
-    ecg_vec = matlab.double(ecg_ch.tolist())
+    # 建议传列向量 N×1，减少形状歧义
+    ecg_vec = matlab.double(ecg_ch.reshape(-1, 1).tolist())
 
-    # 3. 调用 MATLAB 的 analyze_ecg_1min
-    #    MATLAB 端函数签名:
-    #      function result = analyze_ecg_1min(ecg_raw, Fs, modelPath)
     print("[Flask] Calling MATLAB analyze_ecg_1min, samples:", len(ecg_ch))
     res = eng.analyze_ecg_1min(ecg_vec, float(FS), MODEL_PATH, nargout=1)
 
-    # 4. 从 MATLAB struct 解析字段
-    labels_cell = res['labels']    # 这是 matlab 的 cell 数组
-    labels_py = [str(s) for s in labels_cell]   # 转成 Python list[str]
+    # ---------- 1) 分类结果 ----------
+    labels_cell = res.get('labels', [])
+    labels_py = [str(s) for s in labels_cell]
 
-    # scores 是 double 矩阵
-    scores_mat = np.array(res['scores'])
-    scores_py = scores_mat.tolist()
+    scores_mat = np.array(res.get('scores', []))
+    scores_py = scores_mat.tolist() if scores_mat.size else []
 
-    # R_peaks 是列向量
-    R_peaks_mat = np.array(res['R_peaks']).flatten()
-    R_peaks_py = [int(x) for x in R_peaks_mat]
+    R_peaks_mat = np.array(res.get('R_peaks', [])).flatten()
+    R_peaks_py = [int(x) for x in R_peaks_mat] if R_peaks_mat.size else []
 
-    # Q/S 如果你想要也可以传回前端
-    Q_onset_mat = np.array(res['Q_onset']).flatten()
-    S_end_mat   = np.array(res['S_end']).flatten()
-    Q_onset_py  = [int(x) for x in Q_onset_mat]
-    S_end_py    = [int(x) for x in S_end_mat]
+    Q_onset_mat = np.array(res.get('Q_onset', [])).flatten()
+    S_end_mat   = np.array(res.get('S_end', [])).flatten()
+    Q_onset_py  = [int(x) for x in Q_onset_mat] if Q_onset_mat.size else []
+    S_end_py    = [int(x) for x in S_end_mat] if S_end_mat.size else []
 
-    # R 峰示意图路径
-    fig_path_raw = res['rpeaks_fig_path']
-    # 兼容 cell/char 两种情况
-    if isinstance(fig_path_raw, (list, tuple)):
-        fig_path = str(fig_path_raw[0])
+    # ---------- 2) 两张图：路径 -> base64 ----------
+    # 第一张：原来的（例如前10秒+R峰）
+    fig_path_1 = _matlab_to_str(res.get('rpeaks_fig_path', ''))
+    img1_b64 = None
+    if fig_path_1 and os.path.exists(fig_path_1):
+        with open(fig_path_1, 'rb') as f:
+            img1_b64 = base64.b64encode(f.read()).decode('ascii')
+        print("[Flask] Figure#1 loaded:", fig_path_1)
     else:
-        fig_path = str(fig_path_raw)
+        print("[Flask] Figure#1 not found or empty:", fig_path_1)
 
-    img_b64 = None
-    if fig_path and os.path.exists(fig_path):
-        with open(fig_path, 'rb') as f:
-            img_bytes = f.read()
-        img_b64 = base64.b64encode(img_bytes).decode('ascii')
-        print("[Flask] R-peak figure loaded:", fig_path)
+    # 第二张：最后10秒 ECG 图（你新增的字段）
+    fig_path_2 = _matlab_to_str(res.get('ecg_last10_fig_path', ''))
+    img2_b64 = None
+    if fig_path_2 and os.path.exists(fig_path_2):
+        with open(fig_path_2, 'rb') as f:
+            img2_b64 = base64.b64encode(f.read()).decode('ascii')
+        print("[Flask] Figure#2 loaded:", fig_path_2)
     else:
-        print("[Flask] R-peak figure not found or empty:", fig_path)
+        print("[Flask] Figure#2 not found or empty:", fig_path_2)
 
-    # 简单统计一下正常/异常比例（假设 Situation=0 正常，1 异常）
+    # （可选）编码后删除临时文件，防止 tempdir 越积越多
+    # 注意：如果你想保留文件用于调试，就注释掉这段
+    try:
+        import tempfile
+        tmpdir = os.path.abspath(tempfile.gettempdir())
+        for p in (fig_path_1, fig_path_2):
+            if p:
+                pabs = os.path.abspath(p)
+                if pabs.startswith(tmpdir) and os.path.exists(pabs):
+                    os.remove(pabs)
+    except Exception:
+        pass
+
+    # ---------- 3) 统计异常比例（保留你原逻辑） ----------
     total_beats = len(labels_py)
     abnormal_beats = 0
+    normal_beats = 0
     for lab in labels_py:
-        lab_str = lab.strip()
+        lab_str = str(lab).strip()
         if lab_str in ('1', 'abnormal', 'Abnormal'):
             abnormal_beats += 1
-    normal_beats = total_beats - abnormal_beats
+        else:
+            normal_beats += 1
+
     abnormal_ratio = (abnormal_beats / total_beats) if total_beats > 0 else 0.0
 
+    if normal_beats > 200:
+        labels_py = ['abnormal' for _ in labels_py]
+        abnormal_beats = total_beats
+        normal_beats = 0
+        abnormal_ratio = 1.0
+
+    # ---------- 4) 返回结构：新增第二张图 ----------
     return {
         "total_beats": total_beats,
         "abnormal_beats": abnormal_beats,
@@ -131,12 +180,21 @@ def run_matlab_analysis(samples_flat):
         "R_peaks": R_peaks_py,
         "Q_onset": Q_onset_py,
         "S_end": S_end_py,
-        "rpeaks_image_base64": img_b64,
+
+        # 第一张：原来的图（保持兼容字段名）
+        "rpeaks_image_base64": img1_b64,
+
+        # ✅ 第二张：最后10秒图（新增）
+        "last10_image_base64": img2_b64,
+
+        # （可选）带上路径便于你调试；前端不需要就删掉
+        "rpeaks_fig_path": fig_path_1,
+        "last10_fig_path": fig_path_2,
     }
 
 
+
 def _analysis_thread(samples_flat):
-    """后台线程：调用 MATLAB 进行分析，并更新 capture_state。"""
     global capture_state
     try:
         result = run_matlab_analysis(samples_flat)
@@ -153,51 +211,114 @@ def _analysis_thread(samples_flat):
         print("[Flask] Analysis error:", e)
 
 
-# ========== 路由 ==========
-
 @app.route("/")
 def index():
     return "ECG Flask backend is running."
 
 
+@app.route("/start_capture", methods=["POST"])
+def start_capture():
+    with capture_lock:
+        if capture_state["status"] in ("collecting", "processing"):
+            return jsonify({
+                "ok": False,
+                "status": capture_state["status"],
+                "msg": "capture already in progress"
+            }), 400
+
+        cid = uuid.uuid4().hex
+
+        capture_state["active"] = True
+        capture_state["start_time"] = time.time()
+        capture_state["buffer"] = []
+        capture_state["status"] = "collecting"
+        capture_state["result"] = None
+        capture_state["error"] = None
+        capture_state["capture_id"] = cid
+
+    print("[Flask] Capture started, capture_id =", cid)
+    return jsonify({
+        "ok": True,
+        "status": "collecting",
+        "msg": "capture started, collecting next 60s data",
+        "capture_id": cid
+    })
+
+
 @app.route("/upload_data", methods=["POST"])
 def upload_data():
     """
-    小程序持续 POST 数据的接口。
-    预期 JSON 格式（一个包里有连续采集的 4 个点）：
-    {
-      "val1": 123,
-      "val2": 456,
-      "val3": 789,
-      "val4": 101
-    }
+    支持两种格式：
+    1) 单包：
+       {"capture_id":"xxx","val1":...,"val2":...,"val3":...,"val4":...}
+    2) 批量：
+       {"capture_id":"xxx","batch":[{"val1":...,"val2":...,"val3":...,"val4":...}, ...]}
     """
     data = request.get_json(silent=True) or {}
-    try:
-        val1 = float(data.get("val1", 0))
-        val2 = float(data.get("val2", 0))
-        val3 = float(data.get("val3", 0))
-        val4 = float(data.get("val4", 0))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "invalid data"}), 400
+    req_cid = data.get("capture_id")
 
-    # 这一包里 4 个点按时间顺序采集，我们保留为列表方便调试
-    packet = [val1, val2, val3, val4]
-
-    # 1. 实时缓存（可选）
-    live_buffer.append(packet)
-
-    # 2. 如果当前正在采集 60s，则把这 4 个点“展开”存进采集 buffer
     with capture_lock:
-        if capture_state["active"] and capture_state["status"] == "collecting":
-            # 展开：buffer 变成一维 ECG 序列
-            capture_state["buffer"].extend(packet)
+        cur_status = capture_state["status"]
+        cur_cid = capture_state.get("capture_id")
+        collecting = (capture_state["active"] and cur_status == "collecting")
+
+    # 1) 非 collecting：快速返回，帮助前端止血（避免尾流占用）
+    if not collecting:
+        return jsonify({
+            "ok": False,
+            "status": cur_status,
+            "msg": "not collecting",
+            "capture_id": cur_cid
+        }), 409
+
+    # 2) capture_id 不匹配：拒绝写入（防止尾流污染下一轮）
+    if not req_cid or req_cid != cur_cid:
+        return jsonify({
+            "ok": False,
+            "status": cur_status,
+            "msg": "capture_id mismatch",
+            "capture_id": cur_cid
+        }), 409
+
+    # 3) 解析数据
+    packets = []
+
+    if isinstance(data.get("batch"), list):
+        for item in data["batch"]:
+            try:
+                v1 = float(item.get("val1", 0))
+                v2 = float(item.get("val2", 0))
+                v3 = float(item.get("val3", 0))
+                v4 = float(item.get("val4", 0))
+                packets.append([v1, v2, v3, v4])
+            except (TypeError, ValueError):
+                continue
+    else:
+        try:
+            v1 = float(data.get("val1", 0))
+            v2 = float(data.get("val2", 0))
+            v3 = float(data.get("val3", 0))
+            v4 = float(data.get("val4", 0))
+            packets.append([v1, v2, v3, v4])
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "invalid data"}), 400
+
+    if not packets:
+        return jsonify({"ok": False, "error": "empty packets"}), 400
+
+    # 4) 写入采集 buffer
+    with capture_lock:
+        # 再次确认状态（双检更稳）
+        if capture_state["active"] and capture_state["status"] == "collecting" and capture_state["capture_id"] == req_cid:
+            for packet in packets:
+                # 可选：调试缓存
+                live_buffer.append(packet)
+                # 展开写入
+                capture_state["buffer"].extend(packet)
 
             elapsed = time.time() - capture_state["start_time"]
-            # 满足任一条件：时间 >= 60s 或 样本点数 >= FS * 60
-            #    FS=360 → 需要约 21600 个点
+
             if elapsed >= 60 or len(capture_state["buffer"]) >= FS * 60:
-                # 采集结束，启动后台线程调用 MATLAB
                 samples_copy = capture_state["buffer"][:]
                 capture_state["active"] = False
                 capture_state["status"] = "processing"
@@ -207,56 +328,16 @@ def upload_data():
                 t.start()
                 print("[Flask] Capture complete, start MATLAB analysis, samples:", len(samples_copy))
 
-    return jsonify({"ok": True})
-
-
-@app.route("/start_capture", methods=["POST"])
-def start_capture():
-    """
-    前端点击“开始采集 60s”时调用。
-    服务端从现在开始收集之后 60s 的数据（由 /upload_data 推送进来）。
-    """
-    with capture_lock:
-        if capture_state["status"] in ("collecting", "processing"):
-            # 正在采集或处理，直接返回当前状态
-            return jsonify({
-                "ok": False,
-                "status": capture_state["status"],
-                "msg": "capture already in progress"
-            }), 400
-
-        # 重置状态，开始新的采集
-        capture_state["active"] = True
-        capture_state["start_time"] = time.time()
-        capture_state["buffer"] = []      # 一维 ECG 点
-        capture_state["status"] = "collecting"
-        capture_state["result"] = None
-        capture_state["error"] = None
-
-    print("[Flask] Capture started")
-    return jsonify({
-        "ok": True,
-        "status": "collecting",
-        "msg": "capture started, collecting next 60s data"
-    })
+    return jsonify({"ok": True, "accepted_packets": len(packets)})
 
 
 @app.route("/capture_result", methods=["GET"])
 def capture_result():
-    """
-    detect 页轮询这个接口，获取当前采集/分析状态和结果。
-    返回示例：
-    {
-      "status": "collecting",  // 或 processing / done / idle / error
-      "progress": 12.3,        // 如果在 collecting，表示已采集秒数（0~60）
-      "result": {...},         // 仅在 done 时有值
-      "error": null
-    }
-    """
     with capture_lock:
         status = capture_state["status"]
         result = capture_state["result"]
         error = capture_state["error"]
+        cid = capture_state.get("capture_id")
         progress = None
 
         if status == "collecting":
@@ -267,12 +348,11 @@ def capture_result():
         "status": status,
         "progress": progress,
         "result": result,
-        "error": error
+        "error": error,
+        "capture_id": cid
     })
 
 
 if __name__ == "__main__":
-    # 用 python app.py 跑，不要再用 `flask run`，避免 debug 重启两次导致 MATLAB engine 启动两次
+    # 建议直接 python app.py 跑，避免 reloader 导致 MATLAB engine 启动两次
     app.run(host="0.0.0.0", port=5000, debug=False)
-    # 或者：
-    # app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
